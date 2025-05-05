@@ -1,93 +1,125 @@
 #!/usr/bin/env python3
 # telegram_audio_boost_bot.py
-# Телеграм-бот, который принимает ссылку на видео (например, YouTube), скачивает его,
-# усиливает аудиодорожку в 20 dB и возвращает пользователю результат.
+# Телеграм-бот, который принимает ссылки на YouTube-видео, скачивает их,
+# усиливает аудиодорожку в 20 dB и возвращает готовый файл.
 
 import os
+import re
 import logging
 import subprocess
 import tempfile
+import threading
 from telegram import Update
-from telegram.ext import Updater, CommandHandler, MessageHandler, Filters, CallbackContext
+from telegram.ext import Updater, CommandHandler, MessageHandler, Filters, CallbackContext, run_async
 import yt_dlp
 
-# Получите токен вашего бота у @BotFather и сохраните его в переменной окружения BOT_TOKEN
+# Читаем токен из переменной окружения
 TOKEN = os.getenv("BOT_TOKEN")
 
-# Настройка логирования
+# Логирование
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
+# Параметры yt-dlp
+YTDL_OPTS = {
+    'format': 'bestvideo+bestaudio',
+    'merge_output_format': 'mp4',
+    'quiet': True,
+}
+
+# Regex для поиска URL
+URL_REGEX = re.compile(r'https?://\S+')
+
+# Множество занятых чатов (для предотвращения параллельной обработки одного пользователя)
+busy_chats = set()
+busy_lock = threading.Lock()
+
+
 def start(update: Update, context: CallbackContext):
     update.message.reply_text(
-        "Привет! Отправь мне ссылку на видео, и я верну тебе файл с усиленной громкостью x2 (≈20dB)."  
+        "Привет! Пришли любую ссылку на YouTube-видео, и я верну файл с усиленным звуком (×2, ≈20 dB)."
     )
 
 
+def extract_youtube_url(text: str):
+    # Ищем URL в тексте и отбираем YouTube
+    for url in URL_REGEX.findall(text):
+        if 'youtube.com' in url or 'youtu.be' in url:
+            return url
+    return None
+
+
+@run_async
 def process_link(update: Update, context: CallbackContext):
-    url = update.message.text.strip()
     chat_id = update.effective_chat.id
-    status_msg = update.message.reply_text("🔄 Обрабатываю видео, подожди пожалуйста...")
+    # Проверяем, не занял ли чат обработку
+    with busy_lock:
+        if chat_id in busy_chats:
+            update.message.reply_text(
+                "❌ Я уже обрабатываю ваше предыдущее видео. Пожалуйста, дождитесь результата и попробуйте снова."
+            )
+            return
+        busy_chats.add(chat_id)
 
-    with tempfile.TemporaryDirectory() as tmpdir:
-        input_path = os.path.join(tmpdir, "input.mp4")
-        output_path = os.path.join(tmpdir, "output.mp4")
+    try:
+        url = extract_youtube_url(update.message.text)
+        if not url:
+            update.message.reply_text("❌ Пожалуйста, отправьте корректную ссылку на YouTube-видео.")
+            return
 
-        # Шаг 1: Скачать видео через yt-dlp
-        ydl_opts = {
-            'format': 'best[ext=mp4]/best',
-            'outtmpl': input_path,
-            'quiet': True,
-        }
-        try:
+        status_msg = update.message.reply_text("🔄 Загружаю и обрабатываю видео, подождите...")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # Шаг 1: Скачать видео
+            ydl_opts = YTDL_OPTS.copy()
+            ydl_opts['outtmpl'] = os.path.join(tmpdir, '%(id)s.%(ext)s')
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                ydl.download([url])
-        except Exception as e:
-            logger.error(f"Ошибка при загрузке видео: {e}")
-            status_msg.edit_text("❌ Не удалось скачать видео.")
-            return
+                info = ydl.extract_info(url, download=True)
+                input_file = ydl.prepare_filename(info)
 
-        # Шаг 2: Усилить аудио с помощью FFmpeg на 20 dB (приблизительно x10)
-        ffmpeg_cmd = [
-            'ffmpeg', '-y', '-i', input_path,
-            '-filter:a', 'volume=20dB',
-            '-c:v', 'copy',
-            '-c:a', 'aac', '-b:a', '192k',
-            output_path
-        ]
-        try:
-            subprocess.run(ffmpeg_cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        except subprocess.CalledProcessError as e:
-            logger.error(f"Ошибка FFmpeg: {e.stderr.decode()}")
-            status_msg.edit_text("❌ Не удалось обработать видео.")
-            return
+            # Шаг 2: Усилить аудио на 20 dB
+            output_file = os.path.join(tmpdir, f"boosted_{info['id']}.mp4")
+            cmd = [
+                'ffmpeg', '-y', '-i', input_file,
+                '-filter:a', 'volume=20dB',
+                '-c:v', 'copy', '-c:a', 'aac', '-b:a', '192k',
+                output_file
+            ]
+            subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
-        # Шаг 3: Отправить пользователю обработанный файл
-        with open(output_path, 'rb') as f:
-            context.bot.send_document(chat_id=chat_id, document=f)
+            # Шаг 3: Отправить результат
+            with open(output_file, 'rb') as f:
+                context.bot.send_document(chat_id=chat_id, document=f)
 
         status_msg.delete()
+
+    except Exception:
+        logger.exception("Ошибка при обработке видео:")
+        update.message.reply_text("❌ Произошла ошибка при обработке видео. Попробуйте позже.")
+
+    finally:
+        # Убираем чат из занятых
+        with busy_lock:
+            busy_chats.discard(chat_id)
 
 
 def main():
     if not TOKEN:
-        logger.error("Не установлен BOT_TOKEN. Установите переменную окружения перед запуском.")
+        logger.error("Не найден BOT_TOKEN. Установите переменную окружения BOT_TOKEN.")
         return
 
     updater = Updater(TOKEN)
     dp = updater.dispatcher
 
-    # Обработчики
     dp.add_handler(CommandHandler("start", start))
-    dp.add_handler(MessageHandler(Filters.entity("url") & Filters.text, process_link))
+    dp.add_handler(MessageHandler(Filters.text & ~Filters.command, process_link))
 
-    # Запускаем бота
     updater.start_polling()
     updater.idle()
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
