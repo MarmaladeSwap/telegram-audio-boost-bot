@@ -14,9 +14,10 @@ import threading
 from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove
 from telegram.ext import (
     Updater, CommandHandler, MessageHandler, Filters,
-    ConversationHandler, CallbackContext, run_async
+    ConversationHandler, CallbackContext
 )
 import yt_dlp
+from yt_dlp.utils import ExtractorError
 
 # Токен бота
 TOKEN = os.getenv("BOT_TOKEN")
@@ -45,7 +46,7 @@ def extract_youtube_url(text: str):
             return url
     return None
 
-# Команда start
+# Команда /start
 def start(update: Update, context: CallbackContext):
     update.message.reply_text(
         "Привет! Отправьте ссылку на YouTube-видео, чтобы выбрать, как я буду усиливать звук."
@@ -61,9 +62,7 @@ def ask_option(update: Update, context: CallbackContext):
 
     with busy_lock:
         if chat_id in busy_chats:
-            update.message.reply_text(
-                "❌ Я уже обрабатываю ваш запрос. Пожалуйста, подождите."
-            )
+            update.message.reply_text("❌ Я уже обрабатываю ваш запрос. Подождите, пожалуйста.")
             return ConversationHandler.END
         busy_chats.add(chat_id)
 
@@ -73,9 +72,7 @@ def ask_option(update: Update, context: CallbackContext):
         ['Аудио + Видео +10 dB', 'Аудио + Видео +20 dB']
     ]
     markup = ReplyKeyboardMarkup(buttons, one_time_keyboard=True, resize_keyboard=True)
-    update.message.reply_text(
-        "Выберите опцию обработки:", reply_markup=markup
-    )
+    update.message.reply_text("Выберите опцию обработки:", reply_markup=markup)
     return CHOOSING_OPTION
 
 # Обработка выбора опции
@@ -85,7 +82,6 @@ def process_choice(update: Update, context: CallbackContext):
     url = context.user_data.get('url')
     update.message.reply_text("🔄 Начинаю обработку...", reply_markup=ReplyKeyboardRemove())
 
-    # Вычисляем параметры из выбора
     is_video = 'Видео' in choice
     match = re.search(r'\+(\d+)', choice)
     db_value = int(match.group(1)) if match else 20
@@ -113,17 +109,21 @@ def process_choice(update: Update, context: CallbackContext):
                 })
                 ext = 'mp3'
 
-            # Скачиваем
             ydl = yt_dlp.YoutubeDL(ydl_opts)
-            info = ydl.extract_info(url, download=True)
+            try:
+                info = ydl.extract_info(url, download=True)
+            except ExtractorError as e:
+                logger.error("YT-DLP extract error: %s", e)
+                update.message.reply_text(
+                    "❌ Не удалось скачать видео. Возможно, оно требует авторизации или недоступно."
+                )
+                return ConversationHandler.END
+
             input_file = ydl.prepare_filename(info)
             if not is_video:
-                # yt-dlp сохраняет mp3 постпроцессором
                 input_file = os.path.splitext(input_file)[0] + '.mp3'
 
-            # Формируем имя выходного файла
             output_file = os.path.join(tmpdir, f"boosted_{info['id']}.{ext}")
-            # Команда ffmpeg
             if is_video:
                 cmd = [
                     'ffmpeg', '-y', '-i', input_file,
@@ -141,7 +141,6 @@ def process_choice(update: Update, context: CallbackContext):
                 ]
             subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
-            # Отправка с поддержкой стриминга для видео
             with open(output_file, 'rb') as f:
                 if is_video:
                     context.bot.send_video(chat_id=chat_id, video=f, supports_streaming=True)
@@ -177,13 +176,19 @@ def main():
     dp = updater.dispatcher
     conv = ConversationHandler(
         entry_points=[MessageHandler(Filters.regex(r'https?://'), ask_option)],
-        states={CHOOSING_OPTION: [MessageHandler(Filters.regex(r'^(Аудио \+10 dB|Аудио \+20 dB|Аудио \+ Видео \+10 dB|Аудио \+ Видео \+20 dB)$'), process_choice)]},
+        states={
+            CHOOSING_OPTION: [MessageHandler(
+                Filters.regex(r'^(Аудио \+10 dB|Аудио \+20 dB|Аудио \+ Видео \+10 dB|Аудио \+ Видео \+20 dB)$'),
+                process_choice
+            )]
+        },
         fallbacks=[CommandHandler('cancel', cancel)],
-        allow_reentry=True,
+        allow_reentry=True
     )
     dp.add_handler(CommandHandler('start', start))
     dp.add_handler(conv)
-    updater.start_polling()
+    # Начинаем polling с дропом старых обновлений
+    updater.start_polling(drop_pending_updates=True)
     updater.idle()
 
 if __name__ == '__main__':
