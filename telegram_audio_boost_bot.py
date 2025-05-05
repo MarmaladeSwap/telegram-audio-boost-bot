@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # telegram_audio_boost_bot.py
 # Телеграм-бот, который принимает ссылку на видео (например, YouTube), скачивает его,
-# усиливает аудиодорожку на 5 дБ и возвращает пользователю результат.
+# усиливает аудиодорожку в 20 dB и возвращает пользователю результат.
 
 import os
 import logging
@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 
 def start(update: Update, context: CallbackContext):
     update.message.reply_text(
-        "Привет! Отправь мне ссылку на видео, и я верну тебе файл с усиленной громкостью."  
+        "Привет! Отправь мне ссылку на видео, и я верну тебе файл с усиленной громкостью x2 (≈20dB)."  
     )
 
 
@@ -50,10 +50,10 @@ def process_link(update: Update, context: CallbackContext):
             status_msg.edit_text("❌ Не удалось скачать видео.")
             return
 
-        # Шаг 2: Усилить аудио с помощью FFmpeg
+        # Шаг 2: Усилить аудио с помощью FFmpeg на 20 dB (приблизительно x10)
         ffmpeg_cmd = [
             'ffmpeg', '-y', '-i', input_path,
-            '-filter:a', 'volume=5dB',
+            '-filter:a', 'volume=20dB',
             '-c:v', 'copy',
             '-c:a', 'aac', '-b:a', '192k',
             output_path
@@ -82,7 +82,6 @@ def main():
 
     # Обработчики
     dp.add_handler(CommandHandler("start", start))
-    # Ловим сообщения, содержащие URL
     dp.add_handler(MessageHandler(Filters.entity("url") & Filters.text, process_link))
 
     # Запускаем бота
