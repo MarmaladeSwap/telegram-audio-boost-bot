@@ -17,7 +17,7 @@ from telegram.ext import (
     ConversationHandler, CallbackContext
 )
 import yt_dlp
-from yt_dlp.utils import ExtractorError
+from yt_dlp.utils import ExtractorError, DownloadError
 
 # Токен бота
 TOKEN = os.getenv("BOT_TOKEN")
@@ -87,44 +87,67 @@ def process_choice(update: Update, context: CallbackContext):
     db_value = int(match.group(1)) if match else 20
 
     try:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            # Настройка yt-dlp
-            ydl_opts = {'quiet': True}
-            if is_video:
-                ydl_opts.update({
-                    'format': 'bestvideo[height<=240]+bestaudio/best[height<=240]',
-                    'merge_output_format': 'mp4',
-                    'outtmpl': os.path.join(tmpdir, '%(id)s.%(ext)s'),
-                })
-                ext = 'mp4'
-            else:
-                ydl_opts.update({
-                    'format': 'bestaudio',
-                    'outtmpl': os.path.join(tmpdir, '%(id)s.%(ext)s'),
-                    'postprocessors': [{
-                        'key': 'FFmpegExtractAudio',
-                        'preferredcodec': 'mp3',
-                        'preferredquality': '192',
-                    }]
-                })
-                ext = 'mp3'
-
-            ydl = yt_dlp.YoutubeDL(ydl_opts)
-            try:
                 info = ydl.extract_info(url, download=True)
+            except (ExtractorError, DownloadError) as e:
+                logger.error("YT-DLP download error: %s", e)
+                # Попытка через Invidious mirror
+                video_id_match = re.search(r'(?:v=|youtu\.be/)([^?&]+)', url)
+                if video_id_match:
+                    vid = video_id_match.group(1)
+                    fallback_url = f"https://yewtu.be/watch?v={vid}"
+                    update.message.reply_text(
+                        "⚠️ Нужна авторизация на YouTube. Пробую через Invidious mirror..."
+                    )
+                    # Новый экземпляр yt-dlp для fallback
+                    ydl_fb = yt_dlp.YoutubeDL(ydl_opts)
+                    try:
+                        info = ydl_fb.extract_info(fallback_url, download=True)
+                    except Exception as e2:
+                        logger.error("Fallback via Invidious failed: %s", e2)
+                        update.message.reply_text(
+                            "❌ И через Invidious не удалось скачать ролик."
+                        )
+                        return ConversationHandler.END
+                else:
+                    # Если это требование авторизации YouTube
+                    if 'Sign in to confirm' in str(e):
+                        update.message.reply_text(
+                            "❌ Ролик требует авторизации или возрастного подтверждения."
+                        )
+                    else:
+                        update.message.reply_text(
+                            "❌ Не удалось скачать видео. Возможно, оно недоступно или удалено."
+                        )
+                    return ConversationHandler.END
             except ExtractorError as e:
                 logger.error("YT-DLP extract error: %s", e)
-                # Особая обработка для ошибок авторизации на YouTube
-                if 'Sign in to confirm' in str(e):
+                # Пытаемся обойти требование авторизации через Invidious
+                video_id_match = re.search(r'(?:v=|youtu\.be/)([^?&]+)', url)
+                if video_id_match:
+                    vid = video_id_match.group(1)
+                    fallback_url = f"https://yewtu.be/watch?v={vid}"
                     update.message.reply_text(
-                        "❌ Ролик требует авторизации или возрастного подтверждения. "
-                        "К сожалению, я не могу его скачать."
+                        "⚠️ Нужна авторизация на YouTube. Пробую через Invidious mirror..."
                     )
+                    try:
+                        info = ydl.extract_info(fallback_url, download=True)
+                    except ExtractorError:
+                        update.message.reply_text(
+                            "❌ И через Invidious не удалось скачать ролик."
+                        )
+                        return ConversationHandler.END
                 else:
-                    update.message.reply_text(
-                        "❌ Не удалось скачать видео. Возможно, оно недоступно или удалено."
-                    )
-                return ConversationHandler.END
+                    # Особая обработка для ошибок авторизации на YouTube
+                    if 'Sign in to confirm' in str(e):
+                        update.message.reply_text(
+                            "❌ Ролик требует авторизации или возрастного подтверждения. "
+                            "К сожалению, я не могу его скачать."
+                        )
+                    else:
+                        update.message.reply_text(
+                            "❌ Не удалось скачать видео. Возможно, оно недоступно или удалено."
+                        )
+                    return ConversationHandler.END
 
             input_file = ydl.prepare_filename(info)
             if not is_video:
@@ -195,7 +218,8 @@ def main():
     dp.add_handler(CommandHandler('start', start))
     dp.add_handler(conv)
     # Начинаем polling с дропом старых обновлений
-    updater.start_polling(drop_pending_updates=True)
+    # Запускаем polling и очищаем старые апдейты
+    updater.start_polling(clean=True)
     updater.idle()
 
 if __name__ == '__main__':
