@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 # telegram_audio_boost_bot.py
-# Телеграм-бот, который принимает ссылки на YouTube-видео,
-# спрашивает формат (аудио или аудио+видео),
-# скачивает медиа, усиливает аудио в 20 dB и возвращает готовый файл.
+# Телеграм-бот, который принимает ссылку на YouTube-видео,
+# предлагает 4 опции обработки:
+# "Аудио +10 dB", "Аудио +20 dB", "Аудио + Видео +10 dB", "Аудио + Видео +20 dB",
+# скачивает медиа в нужном формате, усиливает аудио и возвращает пользователю.
 
 import os
 import re
@@ -17,7 +18,7 @@ from telegram.ext import (
 )
 import yt_dlp
 
-# Читаем токен из переменной окружения
+# Токен бота
 TOKEN = os.getenv("BOT_TOKEN")
 
 # Логирование
@@ -27,31 +28,31 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Regex для поиска URL
+# Regex для URL
 URL_REGEX = re.compile(r'https?://\S+')
 
 # Состояние разговора
-CHOOSING_FORMAT = 1
+CHOOSING_OPTION = 1
 
-# Для контроля одного запроса в чате
+# Контроль одного запроса в чате
 busy_chats = set()
 busy_lock = threading.Lock()
 
-
-def start(update: Update, context: CallbackContext):
-    update.message.reply_text(
-        "Привет! Пришли ссылку на YouTube-видео, и я спрошу формат обработки."
-    )
-
-
+# Ищем YouTube-ссылку в тексте
 def extract_youtube_url(text: str):
     for url in URL_REGEX.findall(text):
         if 'youtube.com' in url or 'youtu.be' in url:
             return url
     return None
 
+# Команда start
+def start(update: Update, context: CallbackContext):
+    update.message.reply_text(
+        "Привет! Отправьте ссылку на YouTube-видео, чтобы выбрать, как я буду усиливать звук."
+    )
 
-def ask_format(update: Update, context: CallbackContext):
+# Спрашиваем опцию обработки
+def ask_option(update: Update, context: CallbackContext):
     chat_id = update.effective_chat.id
     url = extract_youtube_url(update.message.text)
     if not url:
@@ -61,31 +62,46 @@ def ask_format(update: Update, context: CallbackContext):
     with busy_lock:
         if chat_id in busy_chats:
             update.message.reply_text(
-                "❌ Я уже обрабатываю ваш предыдущий запрос. Пожалуйста, дождитесь результата."
+                "❌ Я уже обрабатываю ваш запрос. Пожалуйста, подождите."
             )
             return ConversationHandler.END
         busy_chats.add(chat_id)
 
     context.user_data['url'] = url
-    buttons = [['Аудио только'], ['Аудио + Видео']]
+    buttons = [
+        ['Аудио +10 dB', 'Аудио +20 dB'],
+        ['Аудио + Видео +10 dB', 'Аудио + Видео +20 dB']
+    ]
     markup = ReplyKeyboardMarkup(buttons, one_time_keyboard=True, resize_keyboard=True)
     update.message.reply_text(
-        "Выберите, что вы хотите получить:", reply_markup=markup
+        "Выберите опцию обработки:", reply_markup=markup
     )
-    return CHOOSING_FORMAT
+    return CHOOSING_OPTION
 
-
-@run_async
+# Обработка выбора опции
 def process_choice(update: Update, context: CallbackContext):
     chat_id = update.effective_chat.id
-    choice = update.message.text
+    choice = update.message.text.strip()
     url = context.user_data.get('url')
-    update.message.reply_text("🔄 Обрабатываю...", reply_markup=ReplyKeyboardRemove())
+    update.message.reply_text("🔄 Начинаю обработку...", reply_markup=ReplyKeyboardRemove())
+
+    # Вычисляем параметры из выбора
+    is_video = 'Видео' in choice
+    match = re.search(r'\+(\d+)', choice)
+    db_value = int(match.group(1)) if match else 20
 
     try:
         with tempfile.TemporaryDirectory() as tmpdir:
+            # Настройка yt-dlp
             ydl_opts = {'quiet': True}
-            if choice == 'Аудио только':
+            if is_video:
+                ydl_opts.update({
+                    'format': 'bestvideo[height<=240]+bestaudio/best[height<=240]',
+                    'merge_output_format': 'mp4',
+                    'outtmpl': os.path.join(tmpdir, '%(id)s.%(ext)s'),
+                })
+                ext = 'mp4'
+            else:
                 ydl_opts.update({
                     'format': 'bestaudio',
                     'outtmpl': os.path.join(tmpdir, '%(id)s.%(ext)s'),
@@ -96,45 +112,45 @@ def process_choice(update: Update, context: CallbackContext):
                     }]
                 })
                 ext = 'mp3'
-            else:
-                ydl_opts.update({
-                    'format': 'bestvideo[height<=240]+bestaudio/best[height<=240]',
-                    'merge_output_format': 'mp4',
-                    'outtmpl': os.path.join(tmpdir, '%(id)s.%(ext)s'),
-                })
-                ext = 'mp4'
 
+            # Скачиваем
             ydl = yt_dlp.YoutubeDL(ydl_opts)
             info = ydl.extract_info(url, download=True)
             input_file = ydl.prepare_filename(info)
-            if choice == 'Аудио только':
+            if not is_video:
+                # yt-dlp сохраняет mp3 постпроцессором
                 input_file = os.path.splitext(input_file)[0] + '.mp3'
 
-            if choice == 'Аудио + Видео':
-                output_file = os.path.join(tmpdir, f"boosted_{info['id']}.mp4")
+            # Формируем имя выходного файла
+            output_file = os.path.join(tmpdir, f"boosted_{info['id']}.{ext}")
+            # Команда ffmpeg
+            if is_video:
                 cmd = [
                     'ffmpeg', '-y', '-i', input_file,
-                    '-filter:a', 'volume=20dB',
-                    '-c:v', 'copy', '-c:a', 'aac', '-b:a', '192k',
+                    '-vf', 'scale=-2:240',
+                    '-filter:a', f'volume={db_value}dB',
+                    '-c:v', 'libx264', '-preset', 'veryfast',
+                    '-c:a', 'aac', '-b:a', '192k',
                     output_file
                 ]
             else:
-                output_file = os.path.join(tmpdir, f"boosted_{info['id']}.mp3")
                 cmd = [
                     'ffmpeg', '-y', '-i', input_file,
-                    '-filter:a', 'volume=20dB',
+                    '-filter:a', f'volume={db_value}dB',
                     output_file
                 ]
-
             subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
+            # Отправка с поддержкой стриминга для видео
             with open(output_file, 'rb') as f:
-                context.bot.send_document(chat_id=chat_id, document=f)
+                if is_video:
+                    context.bot.send_video(chat_id=chat_id, video=f, supports_streaming=True)
+                else:
+                    context.bot.send_audio(chat_id=chat_id, audio=f)
 
     except Exception:
         logger.exception("Ошибка при обработке:")
         context.bot.send_message(chat_id, "❌ Ошибка обработки. Попробуйте позже.")
-
     finally:
         with busy_lock:
             busy_chats.discard(chat_id)
@@ -142,42 +158,33 @@ def process_choice(update: Update, context: CallbackContext):
 
     return ConversationHandler.END
 
-
+# Отмена
 def cancel(update: Update, context: CallbackContext):
     chat_id = update.effective_chat.id
     with busy_lock:
         busy_chats.discard(chat_id)
     context.user_data.clear()
-    update.message.reply_text(
-        'Отменено.', reply_markup=ReplyKeyboardRemove()
-    )
+    update.message.reply_text('Отменено.', reply_markup=ReplyKeyboardRemove())
     return ConversationHandler.END
 
-
+# Основная функция
 def main():
     if not TOKEN:
         logger.error("Не найден BOT_TOKEN. Установите переменную окружения BOT_TOKEN.")
         return
-
     updater = Updater(TOKEN)
-    # Удаляем возможный webhook и сбрасываем старые апдейты
     updater.bot.delete_webhook(drop_pending_updates=True)
-
     dp = updater.dispatcher
     conv = ConversationHandler(
-        entry_points=[MessageHandler(Filters.text & ~Filters.command, ask_format)],
-        states={CHOOSING_FORMAT: [
-            MessageHandler(Filters.regex('^(Аудио только|Аудио \+ Видео)$'), process_choice)
-        ]},
-        fallbacks=[CommandHandler('cancel', cancel)]
+        entry_points=[MessageHandler(Filters.regex(r'https?://'), ask_option)],
+        states={CHOOSING_OPTION: [MessageHandler(Filters.regex(r'^(Аудио \+10 dB|Аудио \+20 dB|Аудио \+ Видео \+10 dB|Аудио \+ Видео \+20 dB)$'), process_choice)]},
+        fallbacks=[CommandHandler('cancel', cancel)],
+        allow_reentry=True,
     )
-
-    dp.add_handler(CommandHandler("start", start))
+    dp.add_handler(CommandHandler('start', start))
     dp.add_handler(conv)
-
     updater.start_polling()
     updater.idle()
-
 
 if __name__ == '__main__':
     main()
