@@ -67,7 +67,6 @@ def ask_format(update: Update, context: CallbackContext):
         busy_chats.add(chat_id)
 
     context.user_data['url'] = url
-    # Клавиатура для выбора формата
     buttons = [['Аудио только'], ['Аудио + Видео']]
     markup = ReplyKeyboardMarkup(buttons, one_time_keyboard=True, resize_keyboard=True)
     update.message.reply_text(
@@ -81,12 +80,10 @@ def process_choice(update: Update, context: CallbackContext):
     chat_id = update.effective_chat.id
     choice = update.message.text
     url = context.user_data.get('url')
-    # Убираем клавиатуру
     update.message.reply_text("🔄 Обрабатываю...", reply_markup=ReplyKeyboardRemove())
 
     try:
         with tempfile.TemporaryDirectory() as tmpdir:
-            # Настройка формата yt-dlp
             ydl_opts = {'quiet': True}
             if choice == 'Аудио только':
                 ydl_opts.update({
@@ -107,14 +104,12 @@ def process_choice(update: Update, context: CallbackContext):
                 })
                 ext = 'mp4'
 
-            # Скачиваем
             ydl = yt_dlp.YoutubeDL(ydl_opts)
             info = ydl.extract_info(url, download=True)
             input_file = ydl.prepare_filename(info)
             if choice == 'Аудио только':
                 input_file = os.path.splitext(input_file)[0] + '.mp3'
 
-            # Если видео+аудио, усиливаем аудио внутри MP4
             if choice == 'Аудио + Видео':
                 output_file = os.path.join(tmpdir, f"boosted_{info['id']}.mp4")
                 cmd = [
@@ -123,22 +118,20 @@ def process_choice(update: Update, context: CallbackContext):
                     '-c:v', 'copy', '-c:a', 'aac', '-b:a', '192k',
                     output_file
                 ]
-                subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             else:
-                # Для MP3 достаточно увеличить громкость в новой дорожке
                 output_file = os.path.join(tmpdir, f"boosted_{info['id']}.mp3")
                 cmd = [
                     'ffmpeg', '-y', '-i', input_file,
                     '-filter:a', 'volume=20dB',
                     output_file
                 ]
-                subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
-            # Отправляем файл
+            subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
             with open(output_file, 'rb') as f:
                 context.bot.send_document(chat_id=chat_id, document=f)
 
-    except Exception as e:
+    except Exception:
         logger.exception("Ошибка при обработке:")
         context.bot.send_message(chat_id, "❌ Ошибка обработки. Попробуйте позже.")
 
@@ -167,11 +160,15 @@ def main():
         return
 
     updater = Updater(TOKEN)
-    dp = updater.dispatcher
+    # Удаляем возможный webhook и сбрасываем старые апдейты
+    updater.bot.delete_webhook(drop_pending_updates=True)
 
+    dp = updater.dispatcher
     conv = ConversationHandler(
         entry_points=[MessageHandler(Filters.text & ~Filters.command, ask_format)],
-        states={CHOOSING_FORMAT: [MessageHandler(Filters.regex('^(Аудио только|Аудио \+ Видео)$'), process_choice)]},
+        states={CHOOSING_FORMAT: [
+            MessageHandler(Filters.regex('^(Аудио только|Аудио \+ Видео)$'), process_choice)
+        ]},
         fallbacks=[CommandHandler('cancel', cancel)]
     )
 
