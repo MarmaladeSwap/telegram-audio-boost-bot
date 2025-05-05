@@ -114,9 +114,16 @@ def process_choice(update: Update, context: CallbackContext):
                 info = ydl.extract_info(url, download=True)
             except ExtractorError as e:
                 logger.error("YT-DLP extract error: %s", e)
-                update.message.reply_text(
-                    "❌ Не удалось скачать видео. Возможно, оно требует авторизации или недоступно."
-                )
+                # Особая обработка для ошибок авторизации на YouTube
+                if 'Sign in to confirm' in str(e):
+                    update.message.reply_text(
+                        "❌ Ролик требует авторизации или возрастного подтверждения. "
+                        "К сожалению, я не могу его скачать."
+                    )
+                else:
+                    update.message.reply_text(
+                        "❌ Не удалось скачать видео. Возможно, оно недоступно или удалено."
+                    )
                 return ConversationHandler.END
 
             input_file = ydl.prepare_filename(info)
