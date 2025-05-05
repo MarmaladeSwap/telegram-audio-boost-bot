@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # telegram_audio_boost_bot.py
 # Телеграм-бот, который принимает ссылки на YouTube-видео, скачивает их,
-# усиливает аудиодорожку в 20 dB и возвращает готовый файл.
+# отслеживает прогресс, усиливает аудиодорожку в 20 dB и возвращает готовый файл.
 
 import os
 import re
@@ -40,12 +40,11 @@ busy_lock = threading.Lock()
 
 def start(update: Update, context: CallbackContext):
     update.message.reply_text(
-        "Привет! Пришли любую ссылку на YouTube-видео, и я верну файл с усиленным звуком (×2, ≈20 dB)."
+        "Привет! Пришли ссылку на YouTube-видео, и я верну файл с усиленным звуком (×2, ≈20 dB)."
     )
 
 
 def extract_youtube_url(text: str):
-    # Ищем URL в тексте и отбираем YouTube
     for url in URL_REGEX.findall(text):
         if 'youtube.com' in url or 'youtu.be' in url:
             return url
@@ -59,7 +58,7 @@ def process_link(update: Update, context: CallbackContext):
     with busy_lock:
         if chat_id in busy_chats:
             update.message.reply_text(
-                "❌ Я уже обрабатываю ваше предыдущее видео. Пожалуйста, дождитесь результата и попробуйте снова."
+                "❌ Я уже обрабатываю ваше предыдущее видео. Пожалуйста, дождитесь результата."
             )
             return
         busy_chats.add(chat_id)
@@ -67,21 +66,35 @@ def process_link(update: Update, context: CallbackContext):
     try:
         url = extract_youtube_url(update.message.text)
         if not url:
-            update.message.reply_text("❌ Пожалуйста, отправьте корректную ссылку на YouTube-видео.")
+            update.message.reply_text("❌ Отправьте корректную ссылку на YouTube-видео.")
             return
 
-        status_msg = update.message.reply_text("🔄 Загружаю и обрабатываю видео, подождите...")
+        # Инициализация прогресса
+        status_msg = update.message.reply_text("🔄 Подготовка к загрузке...")
+
+        # Хук для отслеживания прогресса загрузки
+        def progress_hook(d):
+            try:
+                if d['status'] == 'downloading':
+                    pct = d.get('_percent_str', '').strip()
+                    status_msg.edit_text(f"📥 Загрузка: {pct}")
+                elif d['status'] == 'finished':
+                    status_msg.edit_text("✅ Загрузка завершена. Усиливаю аудио...")
+            except Exception:
+                pass  # Игнорируем ошибки обновления статуса
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            # Шаг 1: Скачать видео
+            # Шаг 1: скачать видео с прогрессом
             ydl_opts = YTDL_OPTS.copy()
             ydl_opts['outtmpl'] = os.path.join(tmpdir, '%(id)s.%(ext)s')
+            ydl_opts['progress_hooks'] = [progress_hook]
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(url, download=True)
                 input_file = ydl.prepare_filename(info)
 
-            # Шаг 2: Усилить аудио на 20 dB
+            # Шаг 2: усиление аудио
             output_file = os.path.join(tmpdir, f"boosted_{info['id']}.mp4")
+            status_msg.edit_text("🔊 Усиление аудио: ~20 dB...")
             cmd = [
                 'ffmpeg', '-y', '-i', input_file,
                 '-filter:a', 'volume=20dB',
@@ -90,18 +103,20 @@ def process_link(update: Update, context: CallbackContext):
             ]
             subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
-            # Шаг 3: Отправить результат
+            # Шаг 3: отправка результата
+            status_msg.edit_text("📤 Отправляю готовый файл...")
             with open(output_file, 'rb') as f:
                 context.bot.send_document(chat_id=chat_id, document=f)
 
+        # Очистка и удаление статуса
         status_msg.delete()
 
     except Exception:
         logger.exception("Ошибка при обработке видео:")
-        update.message.reply_text("❌ Произошла ошибка при обработке видео. Попробуйте позже.")
+        update.message.reply_text("❌ Что-то пошло не так. Попробуйте позже.")
 
     finally:
-        # Убираем чат из занятых
+        # Освобождаем чат
         with busy_lock:
             busy_chats.discard(chat_id)
 
@@ -113,7 +128,6 @@ def main():
 
     updater = Updater(TOKEN)
     dp = updater.dispatcher
-
     dp.add_handler(CommandHandler("start", start))
     dp.add_handler(MessageHandler(Filters.text & ~Filters.command, process_link))
 
